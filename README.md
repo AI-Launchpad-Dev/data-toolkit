@@ -202,4 +202,4 @@ No. Your mock API tables are byte-identical in v1.0.1. Run `python generate.py -
 
 - `capstone-data-toolkit/README.md`: full toolkit reference and design decisions
 - `CHANGELOG.md`: what changed between versions and why
-- **Capstone Data Sourcing Guide**: public datasets and synthetic-data strategy for each problem statement
+- **Data Sourcing Guide**: public datasets and synthetic-data strategy for each problem statement
