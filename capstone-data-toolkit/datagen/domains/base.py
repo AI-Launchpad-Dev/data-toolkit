@@ -15,6 +15,7 @@ and a seed-table spec. The runner does the rest.
 
 from __future__ import annotations
 
+import json
 import random
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta
@@ -29,7 +30,7 @@ from faker import Faker
 REFERENCE_NOW = datetime(2026, 8, 1, 9, 0)
 
 from ..config import settings
-from ..llm import ContentBlocked, complete, complete_json
+from ..llm import ContentBlocked, LLMError, complete, complete_json
 from ..writers import (
     ensure_dir,
     write_csv,
@@ -63,6 +64,10 @@ class EvalCase:
     question: str
     expected: str
     category: str  # factual | multi_hop | unanswerable | injection | guardrail
+    # must_not_contain is substring-matched against the system's answer, so
+    # every entry must be a phrase only a WRONG answer would contain. Never
+    # list a word a correct refusal would naturally echo from the question
+    # ("suppress", "enforceable", "approved") -- that fails the right answer.
     must_cite: list[str] = field(default_factory=list)
     must_not_contain: list[str] = field(default_factory=list)
     expected_route: str = "auto"  # auto | human_review | refuse
@@ -215,7 +220,20 @@ class DomainSpec(ABC):
     def build_intake(self, out_dir: Path) -> dict[str, Any]:
         target = settings.intake_records
         batch = 20
+        path = out_dir / "intake" / "records.jsonl"
         rows: list[dict[str, Any]] = []
+        # Resume. Intake is ~10 calls; losing 180 records to one 429 on the
+        # last batch is exactly the failure a free-tier run hits.
+        if settings.resume and path.exists():
+            rows = [
+                json.loads(line)
+                for line in path.read_text("utf-8").splitlines()
+                if line.strip()
+            ]
+            if rows:
+                print(f"      resuming intake: {min(len(rows), target)} of {target} "
+                      f"records already on disk")
+        resumed = min(len(rows), target)
         attempts = 0
         empty_streak = 0
 
@@ -248,6 +266,11 @@ class DomainSpec(ABC):
                 if empty_streak >= 3:
                     break
                 continue
+            except LLMError:
+                write_jsonl(path, rows[:target])  # keep what we have
+                print(f"      intake interrupted; {len(rows)} records saved, "
+                      f"re-run to continue")
+                raise
 
             if isinstance(got, dict):
                 got = got.get("records", [])
@@ -261,6 +284,9 @@ class DomainSpec(ABC):
                     rows.append(rec)
                     added += 1
 
+            if added:
+                write_jsonl(path, rows[:target])  # checkpoint every batch
+
             if added == 0:
                 empty_streak += 1
                 if empty_streak >= 3:
@@ -273,13 +299,15 @@ class DomainSpec(ABC):
                 empty_streak = 0
 
         rows = rows[:target]
-        write_jsonl(out_dir / "intake" / "records.jsonl", rows)
+        write_jsonl(path, rows)
 
         result: dict[str, Any] = {
             "count": len(rows),
             "path": "intake/records.jsonl",
             "llm_calls": attempts,
         }
+        if resumed:
+            result["resumed"] = resumed
         if len(rows) < target:
             result["shortfall"] = target - len(rows)
             print(
@@ -311,7 +339,24 @@ class DomainSpec(ABC):
             if settings.legacy_table_rng:
                 self.seed_tables()  # discarded; preserves v1.0.0 byte output
             self._tables = self.seed_tables()
+            if not settings.legacy_table_rng:
+                self._tables = self.reconcile_tables(self._tables)
         return self._tables
+
+    def reconcile_tables(
+        self, tables: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Make cross-table facts agree with each other and with the corpus.
+
+        v1.0.x drew every column independently, so the mock APIs contradicted
+        themselves (declined loans with approved amounts, auto-approved
+        refunds far above the automated cap, completed appointments in the
+        future). An agent reading those tools learns nothing, and a grader
+        cannot tell a wrong answer from wrong data. Applied only with
+        --fresh-table-rng so existing teams keep byte-identical tables.
+        Must not draw from self.rng.
+        """
+        return tables
 
     def build_seed_tables(self, out_dir: Path) -> dict[str, Any]:
         tables_dir = ensure_dir(out_dir / "mock_api")
@@ -338,6 +383,20 @@ class DomainSpec(ABC):
         """
 
     def build_eval_set(self, out_dir: Path, corpus_titles: list[str]) -> dict[str, Any]:
+        path = out_dir / "eval" / "golden_set.json"
+        if settings.resume and path.exists():
+            try:
+                existing = json.loads(path.read_text("utf-8"))
+            except json.JSONDecodeError:
+                existing = []
+            if isinstance(existing, list) and len(existing) >= settings.eval_items:
+                by_cat: dict[str, int] = {}
+                for c in existing:
+                    by_cat[c.get("category", "?")] = by_cat.get(c.get("category", "?"), 0) + 1
+                print("      eval set already on disk; skipping (use --no-resume to rebuild)")
+                return {"count": len(existing), "by_category": by_cat,
+                        "path": "eval/golden_set.json", "resumed": True}
+
         hand = self.handwritten_eval_cases()
         need = max(0, settings.eval_items - len(hand))
         generated: list[EvalCase] = []
@@ -374,7 +433,7 @@ class DomainSpec(ABC):
 
         cases = hand + generated[:need]
         payload = [c.__dict__ for c in cases]
-        write_json(out_dir / "eval" / "golden_set.json", payload)
+        write_json(path, payload)
 
         by_cat: dict[str, int] = {}
         for c in cases:

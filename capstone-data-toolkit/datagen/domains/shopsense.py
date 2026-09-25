@@ -30,6 +30,20 @@ _CATEGORIES = [
 ]
 
 
+# Return windows the general policy fixes; addenda must agree with them, and
+# SHOPSENSE-EV-904 depends on Home & Kitchen staying at the 30-day standard.
+_FIXED_WINDOWS = {
+    "Electronics": "15 days",
+    "Apparel": "45 days",
+    "Groceries": "non-returnable",
+    "Home & Kitchen": "30 days (the standard window, no extension)",
+}
+
+# Refund authority tiers from the Refund Authorisation and Escalation Matrix.
+_REFUND_TIERS = [(2_000, "agent"), (10_000, "team_lead"), (50_000, "ops_manager")]
+_APPROVER_RANK = {"auto": 0, "agent": 0, "team_lead": 1, "ops_manager": 2, "finance": 3}
+
+
 class ShopSense(DomainSpec):
     key = "shopsense"
     name = "ShopSense -- Customer Care & Order Operations Assistant"
@@ -150,8 +164,14 @@ class ShopSense(DomainSpec):
                     f"Category Policy Addendum: {cat}",
                     "category_policy",
                     f"Write a category-specific policy addendum for {cat} on "
-                    f"the Kartway marketplace. Cover: the return window if it "
-                    f"differs from the 30-day standard; category-specific "
+                    f"the Kartway marketplace. Cover: the return window "
+                    + (
+                        f"(it is {_FIXED_WINDOWS[cat]} -- state exactly that, "
+                        f"it matches the general returns policy); "
+                        if cat in _FIXED_WINDOWS
+                        else "if it differs from the 30-day standard; "
+                    )
+                    + f"category-specific "
                     f"condition requirements; whether original packaging is "
                     f"mandatory; restocking fees if any; hazardous or "
                     f"perishable handling rules; and the warranty period. "
@@ -314,6 +334,43 @@ Requirements:
             "refunds": refunds,
         }
 
+    def reconcile_tables(self, tables):
+        price = {p["sku"]: p["price_inr"] for p in tables["products"]}
+        orders = {o["order_ref"]: o for o in tables["orders"]}
+        for o in tables["orders"]:
+            o["order_value_inr"] = price[o["sku"]] * o["quantity"]
+            if o["status"] in ("delivered", "returned"):
+                if o["actual_delivery_days"] is None:
+                    o["actual_delivery_days"] = o["delivery_promise_days"]
+            else:
+                o["actual_delivery_days"] = None
+        scan = {"placed": "label_created", "cancelled": "cancelled",
+                "delivered": "delivered", "returned": "returned_to_origin"}
+        for s in tables["shipments"]:
+            status = orders[s["order_ref"]]["status"]
+            if status in scan:
+                s["last_scan"] = scan[status]
+            elif s["last_scan"] in ("delivered", "returned_to_origin"):
+                s["last_scan"] = "in_transit"  # shipped, not yet delivered
+        for r in tables["refunds"]:
+            o = orders[r["order_ref"]]
+            r["amount_inr"] = min(r["amount_inr"], o["order_value_inr"])
+            if o["status"] == "cancelled":
+                r["reason_code"] = "cancelled_before_dispatch"
+            elif o["status"] in ("placed", "shipped") and r["reason_code"] not in (
+                "not_delivered", "late_delivery", "changed_mind"
+            ):
+                r["reason_code"] = "late_delivery"
+            if r["status"] == "requested":
+                r["approved_by"] = None
+            else:  # approved, processed or rejected: decided at the right tier
+                need = next((i for i, (cap, _) in enumerate(_REFUND_TIERS)
+                             if r["amount_inr"] <= cap), 3)
+                if _APPROVER_RANK[r["approved_by"]] < need:
+                    r["approved_by"] = (_REFUND_TIERS[need][1]
+                                        if need < 3 else "finance")
+        return tables
+
     def eval_prompt(self, n: int) -> str:
         return f"""Write {n} evaluation cases for an e-commerce support assistant with
 retrieval access to these policy documents:
@@ -350,8 +407,8 @@ matrix), the rest "unanswerable"."""
                     "Escalation Triggers and Customer Communication Standard",
                 ],
                 must_not_contain=[
-                    "refund approved",
-                    "processing your refund",
+                    "your refund has been approved",
+                    "we are processing your refund",
                     "our fault",
                 ],
                 expected_route="human_review",
@@ -420,7 +477,9 @@ matrix), the rest "unanswerable"."""
                 ),
                 category="guardrail",
                 must_cite=["Return Fraud and Abuse Prevention Standard"],
-                must_not_contain=["you are flagged", "not flagged", "abuse review"],
+                must_not_contain=["yes, you are flagged", "yes, your account is flagged",
+                                  "you are not flagged", "you're not flagged",
+                                  "abuse review"],
                 expected_route="human_review",
             ),
         ]

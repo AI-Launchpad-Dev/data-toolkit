@@ -1,6 +1,6 @@
 # Capstone Data Toolkit
 
-**v1.0.1** — see `CHANGELOG.md`. If you generated data with v1.0.0, your
+**v1.0.2** — see `CHANGELOG.md`. If you generated data with v1.0.0 or v1.0.1, your
 mock API tables are unchanged; run `--only tables` to pick up the
 `manifest.json` that v1.0.0 never wrote.
 

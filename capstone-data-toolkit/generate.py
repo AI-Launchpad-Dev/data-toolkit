@@ -70,8 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fresh-table-rng",
         action="store_true",
-        help="Build mock API tables from a single clean RNG draw. Changes table "
-        "contents relative to v1.0.0 -- use on new projects only.",
+        help="Build mock API tables from a single clean RNG draw and reconcile "
+        "them (statuses, amounts and approvals consistent across tables and "
+        "with the policy corpus). Changes table contents relative to v1.0.0 "
+        "-- use on new projects only.",
     )
     p.add_argument(
         "--dry-run",
@@ -123,7 +125,7 @@ def model_name() -> str:
     }[settings.provider]
 
 
-def run_domain(key: str, stages: set[str], dry_run: bool) -> None:
+def run_domain(key: str, stages: set[str], dry_run: bool) -> bool:
     spec = REGISTRY[key]()
     docs = spec.planned_docs()
 
@@ -147,7 +149,7 @@ def run_domain(key: str, stages: set[str], dry_run: bool) -> None:
             + (1 if "eval" in stages else 0)
         )
         print(f"\n  DRY RUN -- would make roughly {approx_calls} LLM calls.")
-        return
+        return True
 
     out_dir = settings.output_dir / spec.key
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -179,11 +181,13 @@ def run_domain(key: str, stages: set[str], dry_run: bool) -> None:
             public_sources=spec.public_sources,
             partial=True,
         )
-        sys.exit(
+        print(
             f"\n  FAILED: {exc}\n"
             f"  Partial output and manifest written to {out_dir.resolve()}.\n"
-            f"  Re-run the same command; completed corpus documents are skipped."
+            f"  Re-run the same command; completed documents, intake records "
+            f"and eval sets are kept and skipped."
         )
+        return False
 
     # The manifest is the provenance record M8 asks you to defend your data
     # with. v1.0.0 only wrote it from an orchestration path the CLI never
@@ -200,6 +204,7 @@ def run_domain(key: str, stages: set[str], dry_run: bool) -> None:
 
     print(f"\n  done in {time.time() - started:.0f}s -> {out_dir.resolve()}")
     print("  manifest   : manifest.json")
+    return True
 
 
 def main() -> None:
@@ -215,8 +220,11 @@ def main() -> None:
         preflight(stages)
 
     keys = sorted(REGISTRY) if args.domain == "all" else [args.domain]
-    for key in keys:
-        run_domain(key, stages, args.dry_run)
+    # One domain hitting a quota must not stop the others under --domain all.
+    failed = [key for key in keys if not run_domain(key, stages, args.dry_run)]
+    if failed:
+        sys.exit(f"\n  {len(failed)} domain(s) incomplete: {', '.join(failed)}. "
+                 "Re-run to resume.")
 
 
 if __name__ == "__main__":

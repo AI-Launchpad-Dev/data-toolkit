@@ -29,6 +29,10 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
+    # Used automatically when the primary model keeps returning 429/503.
+    # Flash-Lite sits in a separate free-tier quota bucket and is overloaded
+    # far less often. Set to "" to disable.
+    gemini_fallback_model: str = "gemini-flash-lite-latest"
 
     openrouter_api_key: str = ""
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct"
@@ -50,7 +54,11 @@ class Settings(BaseSettings):
     output_dir: Path = Path("./data")
 
     # Generation controls
-    max_retries: int = 4
+    max_retries: int = 8
+    max_backoff: int = 60  # seconds; cap for a single exponential-backoff wait
+    # Minimum gap between Gemini calls. Free-tier Flash allows ~10 requests
+    # per minute; pacing at 6s avoids most 429s instead of recovering from them.
+    min_request_interval: float = 6.0
     request_timeout: int = 120
     temperature: float = 0.9
 

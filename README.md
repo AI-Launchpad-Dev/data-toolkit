@@ -186,7 +186,7 @@ The model ignored the requested category mix, for example returning mostly factu
 Wait and re-run (progress is kept), or switch with `--provider openrouter` or `--provider ollama`. Ollama runs locally with no key and no limit.
 
 **Q9. I used v1.0.0. Do I need to regenerate?**
-No. Your mock API tables are byte-identical in v1.0.1. Run `python generate.py --domain <your-domain> --only tables` once to get the `manifest.json` that v1.0.0 never wrote. See `CHANGELOG.md` for the full list of fixes.
+No. Your mock API tables are byte-identical in v1.0.2. Run `python generate.py --domain <your-domain> --only tables` once to get the `manifest.json` that v1.0.0 never wrote. See `CHANGELOG.md` for the full list of fixes.
 
 ---
 
