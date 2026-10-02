@@ -8,7 +8,6 @@ for structured records, CSV for mock-API seed tables.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +134,26 @@ def write_manifest(
     under what licence" is the first question a reviewer will ask, so the
     generator answers it for you rather than leaving it to memory.
     """
+    # Merge with what earlier runs recorded. Generating tables today and the
+    # corpus tomorrow must leave one manifest describing both; before v1.0.3 a
+    # `--only tables` run erased the record of everything else. An earlier
+    # entry is kept only while the files it describes still exist.
+    kept: dict[str, Any] = {}
+    marker = {
+        "corpus": out_dir / "corpus" / "index.json",
+        "intake": out_dir / "intake" / "records.jsonl",
+        "mock_api": out_dir / "mock_api",
+        "eval": out_dir / "eval" / "golden_set.json",
+    }
+    try:
+        previous = json.loads((out_dir / "manifest.json").read_text("utf-8"))
+        for name, entry in (previous.get("assets") or {}).items():
+            if name in marker and marker[name].exists():
+                kept[name] = entry
+    except (OSError, ValueError, AttributeError):
+        pass
+    assets = {**kept, **assets}
+
     manifest = {
         "domain": domain,
         "toolkit_version": __version__,

@@ -25,15 +25,73 @@ Examples
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 import time
 from pathlib import Path
 
-from datagen import __version__
-from datagen.config import settings
-from datagen.domains import REGISTRY
-from datagen.llm import LLMError
-from datagen.writers import write_manifest
+#: import name -> pip name. pydantic_core first: it is the compiled half of
+#: pydantic, and when it is missing every pydantic import fails after it.
+_REQUIRED = {
+    "pydantic_core": "pydantic-core",
+    "pydantic": "pydantic",
+    "pydantic_settings": "pydantic-settings",
+    "requests": "requests",
+    "reportlab": "reportlab",
+    "faker": "faker",
+}
+
+
+def check_dependencies() -> None:
+    """Replace a 12-line import traceback with the command that fixes it.
+
+    The usual cause is a half-installed virtual environment: `pydantic` is
+    present but its compiled companion `pydantic_core` is not. That happens
+    when an install is interrupted, when packages were installed by a
+    different Python than the one now running, or when antivirus quarantines
+    the compiled file on Windows. The raw error names an internal module and
+    says nothing about the remedy.
+    """
+    broken = []
+    for module, pip_name in _REQUIRED.items():
+        try:
+            importlib.import_module(module)
+        except Exception as exc:  # ImportError, or a DLL load failure on Windows
+            broken.append((pip_name, f"{type(exc).__name__}: {exc}"))
+    if not broken:
+        return
+
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    lines = [
+        "",
+        "  Cannot start: these packages are missing or broken in this Python:",
+        *[f"    - {name:18s} {why}" for name, why in broken],
+        "",
+        f"  Python      : {sys.executable} ({sys.version.split()[0]})",
+        f"  Virtual env : {'active' if in_venv else 'NOT active -- activate .venv first'}",
+        "",
+        "  Fix (run from capstone-data-toolkit/, with the venv activated):",
+        "    python -m pip install --force-reinstall --no-cache-dir -r requirements.txt",
+        "",
+        "  Use `python -m pip`, not bare `pip`: it guarantees the packages go",
+        "  into the same Python that runs generate.py.",
+        "",
+        "  Still failing? The environment is corrupt. Rebuild it:",
+        "    deactivate",
+        "    python -m venv --clear .venv",
+        "    source .venv/Scripts/activate      # macOS/Linux: source .venv/bin/activate",
+        "    python -m pip install -r requirements.txt",
+    ]
+    sys.exit("\n".join(lines))
+
+
+check_dependencies()
+
+from datagen import __version__  # noqa: E402 -- after the dependency check
+from datagen.config import settings  # noqa: E402
+from datagen.domains import REGISTRY  # noqa: E402
+from datagen.llm import LLMError  # noqa: E402
+from datagen.writers import write_manifest  # noqa: E402
 
 _STAGES = ("corpus", "intake", "tables", "eval")
 
@@ -80,6 +138,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the generation plan and exit without calling any API.",
     )
+    p.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print everything a full run produces -- corpus documents, intake "
+        "and eval fields, and every mock API table with its row count, columns "
+        "and types -- then exit. No LLM, no API key, nothing written.",
+    )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -123,6 +188,51 @@ def model_name() -> str:
         "openrouter": settings.openrouter_model,
         "ollama": settings.ollama_model,
     }[settings.provider]
+
+
+def table_schema(key: str) -> dict[str, dict[str, object]]:
+    """{table: {"rows": n, "columns": {column: type}}} for one domain.
+
+    Types are read off the generated data, so this cannot drift from what the
+    generator writes. A column that is empty in some rows is marked nullable
+    with a trailing "?".
+    """
+    names = {str: "str", bool: "bool", int: "int", float: "float"}
+    out: dict[str, dict[str, object]] = {}
+    for table, rows in REGISTRY[key]().cached_seed_tables().items():
+        columns: dict[str, str] = {}
+        for col in rows[0]:
+            values = [r[col] for r in rows]
+            kinds = {names.get(type(v), type(v).__name__) for v in values if v is not None}
+            kind = "/".join(sorted(kinds)) or "null"
+            columns[col] = kind + ("?" if any(v is None for v in values) else "")
+        out[table] = {"rows": len(rows), "columns": columns}
+    return out
+
+
+def print_schema(key: str) -> None:
+    """Everything a full run produces for one domain: files, fields, columns."""
+    spec = REGISTRY[key]()
+    docs = spec.doc_specs()
+    hand = spec.handwritten_eval_cases()
+    print(f"\n{spec.name}\n{'=' * len(spec.name)}")
+    print(f"\n  corpus  ({len(docs)} documents, each as markdown and PDF)"
+          f"  -> corpus/markdown/<slug>.md, corpus/pdf/<slug>.pdf")
+    for doc in docs:
+        print(f"    {doc.slug:38s} {doc.title}")
+    print("\n  intake  (200 records by default)  -> intake/records.jsonl")
+    print(f"    record fields        record_id, {', '.join(spec.intake_fields)}")
+    print(f"    ground_truth fields  {', '.join(spec.intake_truth_fields)}")
+    print("\n  eval  (20 cases by default)  -> eval/golden_set.json")
+    print("    case fields          id, question, expected, category, must_cite, "
+          "must_not_contain, expected_route")
+    print(f"    hand-written cases   {', '.join(c.id for c in hand)}")
+    print(f"    categories required  {', '.join(spec.required_eval_categories)}")
+    print("\n  mock API tables")
+    for table, info in table_schema(key).items():
+        print(f"\n  {table}  ({info['rows']:,} rows)  -> mock_api/{table}.csv|json")
+        for col, kind in info["columns"].items():  # type: ignore[union-attr]
+            print(f"    {col:38s} {kind}")
 
 
 def run_domain(key: str, stages: set[str], dry_run: bool) -> bool:
@@ -204,6 +314,7 @@ def run_domain(key: str, stages: set[str], dry_run: bool) -> bool:
 
     print(f"\n  done in {time.time() - started:.0f}s -> {out_dir.resolve()}")
     print("  manifest   : manifest.json")
+    print(f"  check it   : python -m tests.validate_data --domain {key}")
     return True
 
 
@@ -216,10 +327,15 @@ def main() -> None:
     if unknown:
         sys.exit(f"Unknown stage(s): {', '.join(sorted(unknown))}")
 
+    keys = sorted(REGISTRY) if args.domain == "all" else [args.domain]
+    if args.schema:
+        for key in keys:
+            print_schema(key)
+        return
+
     if not args.dry_run:
         preflight(stages)
 
-    keys = sorted(REGISTRY) if args.domain == "all" else [args.domain]
     # One domain hitting a quota must not stop the others under --domain all.
     failed = [key for key in keys if not run_domain(key, stages, args.dry_run)]
     if failed:

@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # returning empty arrays loops forever and drains the quota.
     max_intake_attempts: int = 30
 
+    # How much corpus text the eval stage shows the model so that expected
+    # answers come from the documents instead of being invented. Shared across
+    # all documents. Lower it for a small local model (Ollama's default
+    # context holds far less); raise it if documents are being cut short.
+    eval_corpus_chars: int = 160_000
+
     # Skip corpus documents already written, so a crashed run resumes.
     resume: bool = True
 
